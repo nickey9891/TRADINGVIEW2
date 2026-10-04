@@ -8,6 +8,7 @@ import {
   getQuotes,
   getTimeSales,
   sampleMarketStream,
+  tradierGet,
 } from "../../../lib/tradier.js";
 
 export const dynamic = "force-dynamic";
@@ -171,6 +172,59 @@ const mcp = createMcpHandler((server) => {
       }
     },
   );
+  server.registerTool(
+    "get_daily_history",
+    {
+      title: "Get historical daily prices",
+      description: "Retrieve Tradier daily OHLCV bars for an explicit date range to research 6- and 12-month trends. Returns all available bars without truncation. Adjustment status is unverified; do not assume dividend-adjusted total returns. Request at least 12 months of warm-up before the backtest period.",
+      inputSchema: z.object({
+        symbol: z.string().trim().min(1).max(32).regex(/^[A-Za-z0-9.^_-]+$/),
+        start: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+        end: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+      }),
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
+    },
+    async ({ symbol, start, end }) => {
+      try {
+        for (const date of [start, end]) {
+          const parsed = new Date(date + "T00:00:00Z");
+          if (!Number.isFinite(parsed.getTime()) || parsed.toISOString().slice(0, 10) !== date) {
+            throw new Error("Dates must be valid calendar dates in YYYY-MM-DD format");
+          }
+        }
+        if (start > end) throw new Error("start must be on or before end");
+        const normalizedSymbol = symbol.trim().toUpperCase();
+        const payload = await tradierGet("/markets/history", {
+          symbol: normalizedSymbol, interval: "daily", start, end,
+        });
+        const raw = payload?.history?.day;
+        const bars = (raw == null ? [] : Array.isArray(raw) ? raw : [raw])
+          .slice().sort((a, b) => String(a.date).localeCompare(String(b.date)));
+        if (!bars.length) throw new Error("Tradier returned no daily bars for this symbol and date range");
+        if (bars.some((bar) => !bar.date || bar.date < start || bar.date > end ||
+          ["open", "high", "low", "close", "volume"].some((key) =>
+            bar[key] == null || !Number.isFinite(Number(bar[key]))))) {
+          throw new Error("Tradier returned invalid or out-of-range daily bars");
+        }
+        return jsonResult({
+          source: "Tradier", symbol: normalizedSymbol, interval: "daily",
+          requestedStart: start, requestedEnd: end,
+          fetchedAt: new Date().toISOString(), count: bars.length,
+          firstDate: bars[0].date, lastDate: bars[bars.length - 1].date,
+          adjustmentStatus: "unverified",
+          notes: [
+            "OHLCV values are returned as supplied by Tradier; no total-return adjustment is applied here.",
+            "Coverage is limited to the returned firstDate and lastDate; missing history is not fabricated.",
+            "The most recent daily bar may be incomplete during the trading session.",
+          ],
+          bars,
+        });
+      } catch (error) {
+        return errorResult(error);
+      }
+    },
+  );
+
 });
 
 async function secured(request) {
